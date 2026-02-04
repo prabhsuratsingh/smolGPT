@@ -1,6 +1,8 @@
 import math
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader
+from train import CharDataset, build_vocab, encode, make_dataset
 
 class SelfAttention(nn.Module):
     def __init__(self, embed_size, heads):
@@ -210,28 +212,185 @@ class GPT(nn.Module):
         out = self.decoder(target, target_mask)
 
         return out
-    
+
+
+@torch.inference_mode()
+def generate(
+    model,
+    stoi,
+    itos,
+    prompt="",
+    max_new_tokens=200,
+    temperature=0.8,
+    top_k=50,
+):
+    model.eval()
+
+    # Encode prompt
+    if prompt:
+        idx = torch.tensor(
+            [[stoi[ch] for ch in prompt]],
+            dtype=torch.long,
+            device=device,
+        )
+    else:
+        idx = torch.tensor(
+            [[stoi["<bos>"]]],
+            dtype=torch.long,
+            device=device,
+        )
+
+    for _ in range(max_new_tokens):
+        # Crop to context window
+        idx_cond = idx[:, -block_size:]
+
+        # Forward pass
+        logits = model(idx_cond)
+        logits = logits[:, -1, :]  # last time step
+
+        # Temperature scaling
+        logits = logits / temperature
+
+        # Top-k filtering
+        if top_k is not None:
+            v, _ = torch.topk(logits, top_k)
+            logits[logits < v[:, [-1]]] = -float("inf")
+
+        # Convert to probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Sample
+        next_token = torch.multinomial(probs, num_samples=1)
+
+        # Append
+        idx = torch.cat([idx, next_token], dim=1)
+
+    return "".join(itos[i.item()] for i in idx[0])
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters())
+
+def count_trainable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+@torch.inference_mode()
+def inference():
+    model = GPT(
+        src_vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        src_pad_index=0,
+        target_pad_index=0,
+        embed_size=128,
+        num_layers=4,
+        heads=4,
+        forward_expansion=4,
+        dropout=0.0,         
+        max_length=block_size,
+        device=device,
+    ).to(device)
+
+    model.load_state_dict(torch.load("gpt_shakespeare.pt", map_location=device))
+    model.eval()
+
+    print(generate(model, stoi, itos, prompt="ROMEO:\n"))
+
+
 
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device : {device}")
+
+    with open("input.txt", "r", encoding="utf-8") as f:
+        text = f.read()
+
     BOS_IDX = 1 
+    block_size = 128
+    batch_size=12
 
-    x = torch.tensor([[1, 5, 6, 4, 3, 9, 5, 2, 0], [1, 8, 7, 3, 4, 5, 6, 7, 2]]).to(
-        device
+    stoi, itos = build_vocab(text)
+    vocab_size = len(stoi)
+
+    dataset = CharDataset(text, stoi, block_size)
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        pin_memory=True
     )
-    target = torch.tensor([[1, 7, 4, 3, 5, 9, 2, 0], [1, 5, 6, 2, 4, 7, 6, 2]]).to(device)
-
-    bos = torch.full((target.size(0), 1), BOS_IDX, device=target.device)
-    input_tokens = torch.cat([bos, target[:, :-1]], dim=1)
 
 
-    src_pad_index = 0
-    target_pad_index = 0
-    src_vocab_size = 10
-    target_vocab_size = 10
+    model = GPT(
+        src_vocab_size=vocab_size,
+        target_vocab_size=vocab_size,
+        src_pad_index=0,
+        target_pad_index=0,
+        embed_size=128,
+        num_layers=4,
+        heads=4,
+        forward_expansion=4,
+        dropout=0.1,
+        max_length=block_size,
+        device=device,
+    ).to(device)
 
-    model = GPT(src_vocab_size, target_vocab_size, src_pad_index, target_pad_index, device=device).to(device)
+    model.train()
 
-    out = model(input_tokens)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-    print(out.shape)
+    epochs = 5  
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+
+        for step, (x, y) in enumerate(loader):
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+
+            logits = model(x) 
+
+            loss = criterion(
+                logits.view(-1, vocab_size),
+                y.view(-1)
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if step % 200 == 0:
+                print(
+                    f"epoch {epoch} | step {step:4d} | loss {loss.item():.4f}"
+                )
+
+        print(
+            f"epoch {epoch} | avg loss {(total_loss / len(loader)):.4f}"
+        )
+
+    print(f"Total parameters: {count_parameters(model):,}")
+    print(f"Trainable parameters: {count_trainable_parameters(model):,}")
+
+
+    print("BASIC TEST : ")
+    print(generate(model, stoi, itos))
+
+    print("SHAKESPEAR TEST")
+    print(
+        generate(
+            model,
+            stoi,
+            itos,
+            prompt="ROMEO:\n",
+            max_new_tokens=300,
+            temperature=0.8,
+            top_k=40,
+        )
+    )
+
+    torch.save(model.state_dict(), "gpt_shakespeare.pt")
+    print("Model saved.")
